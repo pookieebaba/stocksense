@@ -25,38 +25,22 @@ DEFAULT_SYMBOLS = [
 
 
 def fetch_current_price(symbol: str) -> dict | None:
+    """
+    Fetch the latest available price for a single ticker.
+    Returns a dict with OHLCV fields, or None on error.
+    """
     try:
         ticker = yf.Ticker(symbol)
-        # Try fast_info first
-        try:
-            info = ticker.fast_info
-            price = getattr(info, 'last_price', None)
-            if not price:
-                raise ValueError("No price")
-            return {
-                "symbol": symbol.upper(),
-                "open":   getattr(info, 'open', None),
-                "high":   getattr(info, 'day_high', None),
-                "low":    getattr(info, 'day_low', None),
-                "close":  price,
-                "volume": getattr(info, 'last_volume', None),
-            }
-        except:
-            # Fallback to history
-            hist = ticker.history(period="1d", interval="1m")
-            if hist.empty:
-                hist = ticker.history(period="5d")
-            if hist.empty:
-                return None
-            row = hist.iloc[-1]
-            return {
-                "symbol": symbol.upper(),
-                "open":   float(row.get("Open", 0)),
-                "high":   float(row.get("High", 0)),
-                "low":    float(row.get("Low", 0)),
-                "close":  float(row.get("Close", 0)),
-                "volume": int(row.get("Volume", 0)),
-            }
+        info   = ticker.fast_info          # lightweight – no full info call
+
+        return {
+            "symbol": symbol.upper(),
+            "open":   getattr(info, "open",  None),
+            "high":   getattr(info, "day_high", None),
+            "low":    getattr(info, "day_low",  None),
+            "close":  getattr(info, "last_price", None),
+            "volume": getattr(info, "last_volume", None),
+        }
     except Exception as exc:
         logger.error("fetch_current_price(%s) failed: %s", symbol, exc)
         return None
