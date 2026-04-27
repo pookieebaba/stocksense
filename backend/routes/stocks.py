@@ -73,3 +73,13 @@ def snapshots(symbol: str):
         .all()
     )
     return jsonify([r.to_dict() for r in reversed(rows)])
+@stocks_bp.get("/debug")
+def debug():
+    import os, requests
+    key = os.getenv("ALPHA_VANTAGE_KEY", "NOT_SET")
+    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=AAPL&apikey={key}"
+    try:
+        r = requests.get(url, timeout=10).json()
+        return jsonify({"key_preview": key[:6] + "...", "response": r})
+    except Exception as e:
+        return jsonify({"error": str(e)})
