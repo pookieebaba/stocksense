@@ -33,7 +33,7 @@ def create_app(config_class=Config) -> Flask:
     # Extensions
     db.init_app(app)
     jwt.init_app(app)
-    CORS(app, origins=[app.config["FRONTEND_URL"]], supports_credentials=True)
+    CORS(app, origins=["https://stocksense-7g3n.vercel.app", "http://localhost:5173"], supports_credentials=True)
 
     # Blueprints
     app.register_blueprint(auth_bp)
