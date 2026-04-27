@@ -1,129 +1,94 @@
 """
-data_fetcher.py
-───────────────
-Pulls live and historical stock data from Yahoo Finance via yfinance.
-Called both manually and by the APScheduler job.
+data_fetcher.py - Alpha Vantage API (replaces yfinance)
 """
-
-import logging
+import os, logging, requests
 from datetime import datetime, timezone
-
-import yfinance as yf
 import pandas as pd
-
 from extensions import db
 from models.stock import StockPrice
 
-logger = logging.getLogger(__name__)
+logger  = logging.getLogger(__name__)
+AV_KEY  = os.getenv("ALPHA_VANTAGE_KEY", "demo")
+AV_BASE = "https://www.alphavantage.co/query"
 
-
-# ── Popular stocks seeded on first run ──────────────────────────────────────
-DEFAULT_SYMBOLS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA",
-    "META",  "NVDA",  "NFLX",  "BRK-B", "JPM",
-]
-
+DEFAULT_SYMBOLS = ["AAPL","MSFT","GOOGL","AMZN","TSLA","META","NVDA","NFLX"]
 
 def fetch_current_price(symbol: str) -> dict | None:
-    """
-    Fetch the latest available price for a single ticker.
-    Returns a dict with OHLCV fields, or None on error.
-    """
     try:
-        ticker = yf.Ticker(symbol)
-        info   = ticker.fast_info          # lightweight – no full info call
-
+        r = requests.get(AV_BASE, params={
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol.upper(),
+            "apikey": AV_KEY,
+        }, timeout=10).json()
+        q = r.get("Global Quote", {})
+        if not q or not q.get("05. price"):
+            return None
         return {
             "symbol": symbol.upper(),
-            "open":   getattr(info, "open",  None),
-            "high":   getattr(info, "day_high", None),
-            "low":    getattr(info, "day_low",  None),
-            "close":  getattr(info, "last_price", None),
-            "volume": getattr(info, "last_volume", None),
+            "open":   float(q.get("02. open", 0)),
+            "high":   float(q.get("03. high", 0)),
+            "low":    float(q.get("04. low",  0)),
+            "close":  float(q.get("05. price", 0)),
+            "volume": int(float(q.get("06. volume", 0))),
+            "change": float(q.get("09. change", 0)),
+            "change_pct": q.get("10. change percent", "0%"),
         }
-    except Exception as exc:
-        logger.error("fetch_current_price(%s) failed: %s", symbol, exc)
+    except Exception as e:
+        logger.error("fetch_current_price(%s): %s", symbol, e)
         return None
 
-
 def fetch_history(symbol: str, period: str = "6mo", interval: str = "1d") -> pd.DataFrame:
-    """
-    Fetch historical OHLCV data for a ticker.
-
-    period   – yfinance period string: 1d 5d 1mo 3mo 6mo 1y 2y 5y 10y ytd max
-    interval – yfinance interval string: 1m 2m 5m 15m 30m 60m 90m 1h 1d 5d 1wk 1mo 3mo
-    """
     try:
-        ticker = yf.Ticker(symbol)
-        df     = ticker.history(period=period, interval=interval)
-        df.index = pd.to_datetime(df.index)
-        return df
-    except Exception as exc:
-        logger.error("fetch_history(%s) failed: %s", symbol, exc)
+        size = "full" if period in ("1y","2y","5y","max") else "compact"
+        r = requests.get(AV_BASE, params={
+            "function": "TIME_SERIES_DAILY",
+            "symbol": symbol.upper(),
+            "outputsize": size,
+            "apikey": AV_KEY,
+        }, timeout=15).json()
+        series = r.get("Time Series (Daily)", {})
+        if not series:
+            return pd.DataFrame()
+        rows = [{"Date": pd.Timestamp(d), "Open": float(v["1. open"]),
+                 "High": float(v["2. high"]), "Low": float(v["3. low"]),
+                 "Close": float(v["4. close"]), "Volume": int(v["5. volume"])}
+                for d, v in sorted(series.items())]
+        df = pd.DataFrame(rows).set_index("Date")
+        days = {"5d":5,"1mo":30,"3mo":90,"6mo":180,"1y":365,"2y":730}.get(period, 180)
+        return df.tail(days)
+    except Exception as e:
+        logger.error("fetch_history(%s): %s", symbol, e)
         return pd.DataFrame()
 
-
 def search_ticker(query: str) -> list[dict]:
-    """
-    Search for ticker symbols matching a company name or symbol fragment.
-    Returns a list of {symbol, name, exchange} dicts.
-    """
     try:
-        results = yf.Search(query, max_results=8)
-        quotes  = results.quotes or []
-        return [
-            {
-                "symbol":   q.get("symbol", ""),
-                "name":     q.get("longname") or q.get("shortname", ""),
-                "exchange": q.get("exchange", ""),
-            }
-            for q in quotes
-            if q.get("symbol")
-        ]
-    except Exception as exc:
-        logger.error("search_ticker(%s) failed: %s", query, exc)
+        r = requests.get(AV_BASE, params={
+            "function": "SYMBOL_SEARCH",
+            "keywords": query,
+            "apikey": AV_KEY,
+        }, timeout=10).json()
+        return [{"symbol": m.get("1. symbol",""), "name": m.get("2. name",""),
+                 "exchange": m.get("4. region","")}
+                for m in r.get("bestMatches", [])[:8] if m.get("1. symbol")]
+    except Exception as e:
+        logger.error("search_ticker(%s): %s", query, e)
         return []
 
-
 def save_price_snapshot(symbol: str) -> bool:
-    """
-    Fetch the current price for *symbol* and persist it to the DB.
-    Returns True on success, False on failure.
-    """
     data = fetch_current_price(symbol)
-    if not data or data.get("close") is None:
-        logger.warning("No close price returned for %s – skipping", symbol)
+    if not data or not data.get("close"):
         return False
-
-    row = StockPrice(
-        symbol     = data["symbol"],
-        open       = data["open"],
-        high       = data["high"],
-        low        = data["low"],
-        close      = data["close"],
-        volume     = data["volume"],
-        fetched_at = datetime.now(timezone.utc),
-    )
-    db.session.add(row)
+    db.session.add(StockPrice(
+        symbol=data["symbol"], open=data["open"], high=data["high"],
+        low=data["low"], close=data["close"], volume=data["volume"],
+        fetched_at=datetime.now(timezone.utc),
+    ))
     db.session.commit()
-    logger.info("Saved price snapshot for %s: $%.2f", symbol, data["close"])
     return True
 
-
 def refresh_all_watched_symbols(app) -> None:
-    """
-    Called by APScheduler every 15 minutes.
-    Fetches a fresh snapshot for every unique symbol currently in the DB.
-    """
     with app.app_context():
         from models.stock import Watchlist
-        symbols = (
-            db.session.query(Watchlist.symbol)
-            .distinct()
-            .all()
-        )
-        symbols = [row.symbol for row in symbols] or DEFAULT_SYMBOLS
-
-        logger.info("Scheduler: refreshing %d symbols …", len(symbols))
-        for sym in symbols:
+        symbols = [r.symbol for r in db.session.query(Watchlist.symbol).distinct().all()]
+        for sym in (symbols or DEFAULT_SYMBOLS):
             save_price_snapshot(sym)
